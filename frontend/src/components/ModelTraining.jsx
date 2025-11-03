@@ -10,16 +10,27 @@ function ModelTraining({
   setLoading,
 }) {
   const [trainingData, setTrainingData] = useState({
-    modelType: 'rag',
+    modelType: 'langchain_rag', // Default to new LangChain RAG
     modelName: '',
     files: [],
     plainText: '',
+    llmType: 'ollama', // LLM type for langchain_rag
+    llmModel: 'llama2', // LLM model name
+    llmBaseUrl: 'http://localhost:11434', // Ollama base URL
   });
   const [filePreviews, setFilePreviews] = useState([]);
+  const [isTraining, setIsTraining] = useState(false); // Local loading state for button
 
   const modelTypes = [
     { value: 'xgboost', label: 'XGBoost (Classification/Regression)' },
-    { value: 'rag', label: 'RAG (Retrieval Augmented Generation)' },
+    {
+      value: 'rag',
+      label: 'RAG - FAISS (Retrieval Augmented Generation - Legacy)',
+    },
+    {
+      value: 'langchain_rag',
+      label: 'RAG - LangChain (pgvector + LLM - Recommended)',
+    },
     { value: 'transformer', label: 'Transformer (Text Generation)' },
   ];
 
@@ -63,7 +74,16 @@ function ModelTraining({
       return;
     }
 
+    console.log('='.repeat(80));
+    console.log('Training Request Started');
+    console.log('Agent:', selectedAgent.name, '(ID:', selectedAgent.id + ')');
+    console.log('Model Type:', trainingData.modelType);
+    console.log('Model Name:', trainingData.modelName);
+    console.log('Files:', trainingData.files.length);
+    console.log('Plain Text Length:', trainingData.plainText.length, 'chars');
+
     setLoading(true);
+    setIsTraining(true); // Disable button
 
     try {
       const formData = new FormData();
@@ -71,37 +91,77 @@ function ModelTraining({
       formData.append('model_type', trainingData.modelType);
       formData.append('model_name', trainingData.modelName);
 
+      // Add parameters for langchain_rag
+      if (trainingData.modelType === 'langchain_rag') {
+        const parameters = {
+          llm_type: trainingData.llmType,
+          llm_config: {
+            model_name: trainingData.llmModel,
+            base_url: trainingData.llmBaseUrl,
+            temperature: 0.7,
+          },
+          embedding_model: 'all-MiniLM-L6-v2',
+          top_k: 3,
+        };
+        console.log('LangChain RAG Parameters:', parameters);
+        formData.append('parameters', JSON.stringify(parameters));
+      }
+
       if (trainingData.files.length > 0) {
+        console.log(
+          'Uploading files:',
+          trainingData.files.map((f) => f.name).join(', ')
+        );
         trainingData.files.forEach((file) => {
           formData.append('files', file);
         });
       }
 
       if (trainingData.plainText.trim()) {
+        console.log('Including plain text input');
         formData.append('plain_text', trainingData.plainText);
       }
 
-      await modelsAPI.train(formData);
+      console.log('Sending training request to backend...');
+      const startTime = Date.now();
+      const response = await modelsAPI.train(formData);
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+      console.log(`Training request completed in ${duration} seconds`);
+      console.log('Model ID:', response.id);
+      console.log('Model Status:', response.status);
 
       // Reset form
       setTrainingData({
-        modelType: 'rag',
+        modelType: 'langchain_rag', // Default to new LangChain RAG
         modelName: '',
         files: [],
         plainText: '',
+        llmType: 'ollama',
+        llmModel: 'llama2',
+        llmBaseUrl: 'http://localhost:11434',
       });
       setFilePreviews([]);
 
       onModelTrained();
+      console.log('Training completed successfully!');
+      console.log('='.repeat(80));
       alert('Model training started successfully!');
     } catch (error) {
-      console.error('Error training model:', error);
+      console.error('='.repeat(80));
+      console.error('Training Error:', error);
+      console.error('Error Details:', {
+        message: error.message,
+        response: error.response?.data,
+        status: error.response?.status,
+      });
+      console.error('='.repeat(80));
       alert(
         'Failed to train model: ' +
           (error.response?.data?.detail || error.message)
       );
     } finally {
       setLoading(false);
+      setIsTraining(false); // Re-enable button
     }
   };
 
@@ -173,6 +233,102 @@ function ModelTraining({
                 placeholder="e.g., My RAG Model v1"
               />
             </div>
+
+            {/* LangChain RAG Parameters */}
+            {trainingData.modelType === 'langchain_rag' && (
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 space-y-4">
+                <h3 className="text-sm font-semibold text-blue-900 mb-3">
+                  LangChain RAG Configuration
+                </h3>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    LLM Type *
+                  </label>
+                  <select
+                    value={trainingData.llmType}
+                    onChange={(e) =>
+                      setTrainingData({
+                        ...trainingData,
+                        llmType: e.target.value,
+                      })
+                    }
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  >
+                    <option value="ollama">Ollama (Free, Local)</option>
+                    <option value="openai">OpenAI (Paid, Cloud)</option>
+                    <option value="huggingface">
+                      HuggingFace (Free, Local)
+                    </option>
+                  </select>
+                </div>
+
+                {trainingData.llmType === 'ollama' && (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                        Ollama Model Name *
+                      </label>
+                      <input
+                        type="text"
+                        value={trainingData.llmModel}
+                        onChange={(e) =>
+                          setTrainingData({
+                            ...trainingData,
+                            llmModel: e.target.value,
+                          })
+                        }
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder="e.g., llama2, mistral, codellama"
+                      />
+                      <p className="text-xs text-gray-500 mt-1">
+                        Make sure the model is downloaded: ollama pull{' '}
+                        {trainingData.llmModel}
+                      </p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                        Ollama Base URL
+                      </label>
+                      <input
+                        type="text"
+                        value={trainingData.llmBaseUrl}
+                        onChange={(e) =>
+                          setTrainingData({
+                            ...trainingData,
+                            llmBaseUrl: e.target.value,
+                          })
+                        }
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder="http://localhost:11434"
+                      />
+                    </div>
+                  </>
+                )}
+
+                {trainingData.llmType === 'openai' && (
+                  <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3">
+                    <p className="text-sm text-yellow-800">
+                      <strong>Note:</strong> OpenAI requires an API key. Set the{' '}
+                      <code className="bg-yellow-100 px-1 rounded">
+                        OPENAI_API_KEY
+                      </code>{' '}
+                      environment variable on the backend server.
+                    </p>
+                  </div>
+                )}
+
+                {trainingData.llmType === 'huggingface' && (
+                  <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3">
+                    <p className="text-sm text-yellow-800">
+                      <strong>Note:</strong> HuggingFace models are free but
+                      slower. They require more memory and may take longer to
+                      load.
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* File Upload */}
             <div>
@@ -251,9 +407,14 @@ function ModelTraining({
             <div className="flex justify-end">
               <button
                 type="submit"
-                className="bg-blue-600 text-white px-8 py-3 rounded-lg hover:bg-blue-700 transition-colors font-medium"
+                disabled={isTraining || !selectedAgent}
+                className={`px-8 py-3 rounded-lg transition-colors font-medium ${
+                  isTraining || !selectedAgent
+                    ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
+                    : 'bg-blue-600 text-white hover:bg-blue-700'
+                }`}
               >
-                Start Training
+                {isTraining ? 'Training...' : 'Start Training'}
               </button>
             </div>
           </form>

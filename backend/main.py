@@ -4,9 +4,22 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
 import warnings
+import logging
+from datetime import datetime
 
 # Suppress multiprocessing warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='multiprocessing')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 from config.database import engine, get_db, Base
 from models import database_models, schemas
@@ -87,11 +100,17 @@ async def train_model(
     """Train a model with uploaded files or plain text"""
     import json
     
+    logger.info(f"=" * 80)
+    logger.info(f"Training Request Started - {datetime.now().isoformat()}")
+    logger.info(f"Agent ID: {agent_id}, Model Type: {model_type}, Model Name: {model_name}")
+    
     # Validate inputs
     if not model_type or not model_name:
+        logger.error(f"Validation failed: Missing model_type or model_name")
         raise HTTPException(status_code=400, detail="Model type and name are required")
     
     if model_type not in ['xgboost', 'rag', 'langchain_rag', 'transformer']:
+        logger.error(f"Validation failed: Invalid model type '{model_type}'")
         raise HTTPException(status_code=400, detail="Invalid model type. Must be: xgboost, rag, langchain_rag, or transformer")
     
     # Parse parameters
@@ -99,10 +118,15 @@ async def train_model(
     if parameters:
         try:
             model_params = json.loads(parameters)
+            logger.info(f"Parameters parsed: {json.dumps(model_params, indent=2)}")
         except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse parameters JSON: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Invalid JSON in parameters: {str(e)}")
+    else:
+        logger.info("No parameters provided, using defaults")
     
     # Create model record
+    logger.info("Creating model record in database...")
     try:
         db_model = database_models.TrainedModel(
             agent_id=agent_id,
@@ -114,25 +138,33 @@ async def train_model(
         db.add(db_model)
         db.commit()
         db.refresh(db_model)
+        logger.info(f"Model record created with ID: {db_model.id}")
     except Exception as e:
         db.rollback()
+        logger.error(f"Failed to create model record: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create model record: {str(e)}")
     
     try:
         # Process documents
+        logger.info("Starting document processing...")
         all_documents = []
         
         # Process uploaded files
         if files:
-            for file in files:
+            logger.info(f"Processing {len(files)} uploaded file(s)...")
+            for idx, file in enumerate(files, 1):
                 try:
+                    logger.info(f"[{idx}/{len(files)}] Processing file: {file.filename} (size: {file.size} bytes)")
                     content = await file.read()
                     documents = process_file(content, file.filename)
+                    logger.info(f"  -> Extracted {len(documents)} document chunk(s) from {file.filename}")
+                    
                     # Get file type from processor
                     from utils.file_processor import get_file_type
                     file_type = get_file_type(file.filename)
                     
-                    for text, metadata in documents:
+                    for doc_idx, (text, metadata) in enumerate(documents, 1):
+                        logger.debug(f"  -> Storing document chunk {doc_idx}/{len(documents)} (length: {len(text)} chars)")
                         db_training_data = database_models.TrainingData(
                             model_id=db_model.id,
                             document_type=file_type,
@@ -142,8 +174,10 @@ async def train_model(
                         )
                         db.add(db_training_data)
                         all_documents.append(text)
+                    logger.info(f"  -> Completed processing {file.filename}")
                 except Exception as file_error:
                     # If file processing fails, rollback and return error
+                    logger.error(f"Failed to process file '{file.filename}': {str(file_error)}", exc_info=True)
                     db_model.status = "failed"
                     db.commit()
                     raise HTTPException(
@@ -153,7 +187,9 @@ async def train_model(
         
         # Process plain text
         if plain_text:
+            logger.info(f"Processing plain text input (length: {len(plain_text)} chars)...")
             documents = process_plain_text(plain_text)
+            logger.info(f"  -> Split into {len(documents)} document chunk(s)")
             for text, metadata in documents:
                 db_training_data = database_models.TrainingData(
                     model_id=db_model.id,
@@ -165,26 +201,62 @@ async def train_model(
                 db.add(db_training_data)
                 all_documents.append(text)
         
+        logger.info(f"Document processing complete. Total documents: {len(all_documents)}")
+        
         if not all_documents:
+            logger.error("No documents provided for training")
             db_model.status = "failed"
             db.commit()
             raise HTTPException(status_code=400, detail="No documents provided for training")
         
+        # Commit all training data records to database before training
+        logger.info("Committing training data records to database...")
+        try:
+            db.commit()
+            logger.info(f"Successfully committed {len(all_documents)} training data records")
+            
+            # Verify records were saved (especially important for langchain_rag)
+            if model_type == 'langchain_rag':
+                saved_records = db.query(database_models.TrainingData).filter(
+                    database_models.TrainingData.model_id == db_model.id
+                ).count()
+                logger.info(f"Verified: {saved_records} training data records saved in database")
+                if saved_records != len(all_documents):
+                    logger.warning(f"Record count mismatch: {saved_records} saved but {len(all_documents)} expected")
+        except Exception as commit_error:
+            logger.error(f"Failed to commit training data: {str(commit_error)}", exc_info=True)
+            db.rollback()
+            db_model.status = "failed"
+            db.commit()
+            raise HTTPException(status_code=500, detail=f"Failed to save training data: {str(commit_error)}")
+        
         # Train the model
+        logger.info(f"Initializing {model_type} trainer...")
         trainer = get_trainer(model_type, db)
+        logger.info(f"Trainer initialized: {type(trainer).__name__}")
+        
+        logger.info(f"Starting model training with {len(all_documents)} documents...")
+        start_time = datetime.now()
         
         # Handle langchain_rag trainer which has different interface
         if model_type == 'langchain_rag':
             from services.langchain_rag_trainer import LangChainRAGTrainer
             if isinstance(trainer, LangChainRAGTrainer):
+                logger.info("Using LangChain RAG trainer with model_id parameter")
                 # LangChainRAGTrainer needs model_id and stores embeddings in DB
                 model_data, metadata = trainer.train(all_documents, db_model.id, model_params)
             else:
+                logger.warning("Expected LangChainRAGTrainer but got different type")
                 model_data, metadata = trainer.train(all_documents, model_params)
         else:
             model_data, metadata = trainer.train(all_documents, model_params)
         
+        training_duration = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Model training completed in {training_duration:.2f} seconds")
+        logger.info(f"Training metadata: {json.dumps(metadata, indent=2, default=str)}")
+        
         # Update model record - handle both file paths and bytes
+        logger.info("Updating model record with training results...")
         db_model.status = "completed"
         db_model.training_documents_count = len(all_documents)
         db_model.accuracy = metadata.get('accuracy')
@@ -193,37 +265,48 @@ async def train_model(
         # Store model data appropriately based on size
         # langchain_rag stores everything in DB, so no weights needed
         if model_type == 'langchain_rag':
+            logger.info("LangChain RAG: Storing embeddings in database (no weights file)")
             db_model.weights_blob = None
             db_model.weights_file_path = None
         elif isinstance(model_data, str):
             # File path for large models (transformers)
+            logger.info(f"Storing model weights in file: {model_data}")
             db_model.weights_file_path = model_data
             db_model.weights_blob = None
         else:
             # Bytes for small models (XGBoost, RAG)
+            weights_size = len(model_data) if model_data else 0
+            logger.info(f"Storing model weights in database (size: {weights_size / 1024:.2f} KB)")
             db_model.weights_blob = model_data
             db_model.weights_file_path = None
         
         try:
             db.commit()
             db.refresh(db_model)
+            logger.info(f"Model record updated successfully. Model ID: {db_model.id}, Status: {db_model.status}")
         except Exception as commit_error:
+            logger.error(f"Failed to commit model record: {str(commit_error)}", exc_info=True)
             # If commit fails, clean up file if it was created
             if isinstance(model_data, str) and os.path.exists(model_data):
                 try:
+                    logger.warning(f"Cleaning up model file: {model_data}")
                     os.remove(model_data)
                 except:
-                    pass
+                    logger.error(f"Failed to remove model file: {model_data}")
             db.rollback()
             raise commit_error
         
+        logger.info(f"Training completed successfully for model ID: {db_model.id}")
+        logger.info(f"=" * 80)
         return db_model
         
     except HTTPException:
         # Re-raise HTTPExceptions as-is
+        logger.error("HTTPException raised during training")
         raise
     except Exception as e:
         # Handle any other exceptions
+        logger.error(f"Training failed with exception: {str(e)}", exc_info=True)
         error_msg = str(e)
         # Provide more helpful error messages
         if "accelerate" in error_msg.lower():
@@ -233,11 +316,16 @@ async def train_model(
         
         # Try to mark model as failed
         try:
+            logger.info("Marking model as failed in database...")
             db_model.status = "failed"
             db.commit()
-        except:
+            logger.info("Model status updated to 'failed'")
+        except Exception as db_error:
+            logger.error(f"Failed to update model status: {str(db_error)}")
             db.rollback()
         
+        logger.error(f"Training failed: {error_msg}")
+        logger.info(f"=" * 80)
         raise HTTPException(status_code=500, detail=f"Training failed: {error_msg}")
 
 @app.get("/api/models/", response_model=List[schemas.TrainedModel])
